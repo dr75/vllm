@@ -1,0 +1,38 @@
+# use this file to initialize the virtual env
+# usage: source venv.rc
+
+venv=./.venv
+requirements=./requirements/common.txt
+requirements_dev=./requirements/mac.txt
+
+os=`uname`
+if [ "$os" = "Darwin" ]; then
+  echo "Mac OS..."
+  requirements_os=./requirements_mac.txt
+  mod_venv=venv
+else
+  echo "Linux..."
+  requirements_os=./requirements_linux.txt
+  #mod_venv=virtualenv
+  mod_venv=venv
+fi
+
+# create the venv if not yet there
+if [ ! -d "$venv" ]; then
+#  virtualenv -p python3.10 $venv
+#  python3.10 -m venv $venv
+#  python3.10 -m virtualenv $venv
+  python3.12 -m $mod_venv $venv
+  source $venv/bin/activate
+  pip install --upgrade pip
+else
+  source $venv/bin/activate
+fi
+
+pip install -r $requirements  | grep -v "Requirement already satisfied"
+
+if [ -e $requirements_dev ]; then
+  pip install -r $requirements_dev  | grep -v "Requirement already satisfied"
+fi
+
+#pip install -r $requirements_os  | grep -v "Requirement already satisfied"

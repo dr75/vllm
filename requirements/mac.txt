@@ -1,0 +1,6 @@
+torch
+torchvision
+torchaudio
+-r cpu.txt
+-r lint.txt
+pytest
