@@ -272,10 +272,11 @@ def need_extra_keys(request: Request) -> bool:
     Returns:
         bool: Whether blocks allocated to this request need extra hash keys.
     """
+    print(f"Salt: {request.cache_salt}")
 
     # Multimodal requests need to include the MM hash.
     # LoRA requests need to include the LoRA ID.
-    return bool(request.mm_positions) or (request.lora_request is not None)
+    return bool(request.mm_positions) or (request.lora_request is not None) or (request.cache_salt is not None)
 
 
 def _gen_mm_extra_hash_keys(request: Request, start_token_idx: int,
@@ -381,8 +382,9 @@ def generate_block_hash_extra_keys(
     mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
         request, start_token_idx, end_token_idx, start_mm_idx)
     lora_extra_keys: list[int] = _gen_lora_extra_hash_keys(request)
+    cache_salt_keys: list[str] = [request.cache_salt] if (request.cache_salt and start_token_idx == 0) else []
 
-    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys
+    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys + cache_salt_keys
 
     if not extra_keys:
         return None, new_start_mm_idx
@@ -601,10 +603,10 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
     Only models with one type of KV cache are supported yet. This function tries
-    to convert the KV cache specs to one type if the model is a hybrid model 
+    to convert the KV cache specs to one type if the model is a hybrid model
     with multiple type of KV cache. It will convert all SlidingWindowSpec to
     FullAttentionSpec if both types are present.
-    
+
     Args:
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """

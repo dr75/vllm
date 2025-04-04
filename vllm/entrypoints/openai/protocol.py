@@ -375,6 +375,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "If specified with 'logprobs', tokens are represented "
             " as strings of the form 'token_id:{token_id}' so that tokens "
             "that are not JSON-encodable can be identified."))
+    cache_salt: Optional[Union[str, dict]] = Field(
+        default=None,
+        description=(
+            "If specified, the prefix cache will be salted with these values. This "
+            "is used to prevent an attacker to guess the prompt of a request. "
+            "If a single string is provided, the salt is applied to the first block. "
+            "If a dict is provided, the key is the index of message and the value is "
+            "the salt to be used for the first block of that message."))
 
     # doc: end-chat-completion-extra-params
 
@@ -1533,9 +1541,9 @@ class TranscriptionRequest(OpenAIBaseModel):
     """
 
     stream: Optional[bool] = False
-    """Custom field not present in the original OpenAI definition. When set, 
+    """Custom field not present in the original OpenAI definition. When set,
     it will enable output to be streamed in a similar fashion as the Chat
-    Completion endpoint. 
+    Completion endpoint.
     """
     # Flattened stream option to simplify form data.
     stream_include_usage: Optional[bool] = False
