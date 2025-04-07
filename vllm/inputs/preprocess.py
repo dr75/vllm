@@ -342,6 +342,7 @@ class InputPreprocessor:
             token_type_ids = tokens_content.get("token_type_ids")
             multi_modal_data = tokens_content.get("multi_modal_data")
             mm_processor_kwargs = tokens_content.get("mm_processor_kwargs")
+            cache_salt = tokens_content.get("cache_salt")
 
             if multi_modal_data is not None and self._can_process_multimodal():
                 return self._process_multimodal(
@@ -352,12 +353,19 @@ class InputPreprocessor:
                     return_mm_hashes=return_mm_hashes,
                 )
 
-            return token_inputs(
+            res = token_inputs(
                 prompt_token_ids=prompt_token_ids,
                 token_type_ids=token_type_ids,
                 multi_modal_data=multi_modal_data,
                 mm_processor_kwargs=mm_processor_kwargs,
             )
+
+            # TODO: refactor the entire function to remove all the code
+            # duplication (e.g., mm_processor_kwargs work the same and
+            # are append in multiple places)
+            if cache_salt is not None:
+                res["cache_salt"] = cache_salt
+            return res
 
         if parsed["type"] == "text":
             text_content = parsed["content"]

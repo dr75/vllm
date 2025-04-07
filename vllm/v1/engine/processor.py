@@ -278,6 +278,10 @@ class Processor:
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            cache_salt=processed_inputs.get(
+                "cache_salt", None
+            ),  # TODO: Maybe enforce "cache_salt" such that it cannot be
+            # missing and must be None if not there.
         )
 
     def _validate_model_inputs(self,
