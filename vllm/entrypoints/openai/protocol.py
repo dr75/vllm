@@ -730,10 +730,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @classmethod
     def check_cache_salt_support(cls, data):
         if data.get("cache_salt") is not None:
-            if not envs.VLLM_USE_V1:
-                raise ValueError(
-                    "Parameter 'cache_salt' is not supported with "
-                    "this instance of vLLM, which uses engine V0.")
+            # if not envs.VLLM_USE_V1:
+            #     raise ValueError(
+            #         "Parameter 'cache_salt' is not supported with "
+            #         "this instance of vLLM, which uses engine V0.")
             if not isinstance(data["cache_salt"],
                               str) or not data["cache_salt"]:
                 raise ValueError("Parameter 'cache_salt' must be a "
