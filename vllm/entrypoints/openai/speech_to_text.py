@@ -64,10 +64,191 @@ ResponseType: TypeAlias = (
 
 logger = init_logger(__name__)
 
+VOXTRAL_TIMESTAMP = "<00:00.0>"
+
+
+def encode(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    return [int(t) for t in token_ids]
+
+
+def _parse_verbose_json_segments_from_timestamp_tags(
+    token_ids: list[int],
+    token_strs: list[str],
+    *,
+    start_time: float,
+) -> list[tuple[float, float, str, list[int]]]:
+    """Parse verbose_json segments from timestamp tags emitted as text.
+
+    Some models emit timestamps as text tags like `<00:01.5>` and closing tags
+    like `</00:01.5>` (or even variants that omit the leading `<`, e.g.
+    `00:01.5>` or `/00:01.5>`). This helper is a best-effort parser that tries
+    to reconstruct (start, end, text, token_ids) segments from the token stream.
+
+    Signature is intentionally minimal to allow unit testing without a tokenizer.
+    """
+
+    def _parse_timestamp_seconds(ts_text: str) -> float | None:
+        ts_text = ts_text.strip()
+        if not ts_text:
+            return None
+        parts = ts_text.split(":")
+        try:
+            total = 0.0
+            for p in parts[:-1]:
+                total = total * 60.0 + float(int(p))
+            total = total * 60.0 + float(parts[-1])
+            return total
+        except Exception:
+            return None
+
+    def _consume_tag_at(i: int) -> tuple[int, str, bool, float] | None:
+        """If a timestamp tag starts at i, return (next_i, prefix_text, is_close, seconds)."""
+        if i >= len(token_strs):
+            return None
+
+        first = token_strs[i]
+        if not first:
+            return None
+
+        # Heuristic: tags will end with `>` within a short window and contain
+        # both ':' and '.' to represent seconds.
+        lookahead = "".join(token_strs[i : min(len(token_strs), i + 24)])
+        if ">" not in lookahead or ":" not in lookahead or "." not in lookahead:
+            return None
+
+        # Tag start must be plausible: `<...`, `</...`, `/...`, or `00:...>`.
+        stripped = first.lstrip()
+        if not (
+            "<" in first
+            or stripped.startswith("/")
+            or stripped[:1].isdigit()
+            or first.endswith("/")
+        ):
+            return None
+
+        # Split any prefix text before a tag marker; e.g. token like `.</`.
+        marker_idx = -1
+        for ch in ("<", "/"):
+            idx = first.find(ch)
+            if idx != -1 and (marker_idx == -1 or idx < marker_idx):
+                marker_idx = idx
+        if marker_idx == -1:
+            marker_idx = 0
+
+        prefix_text = first[:marker_idx]
+        tag_pieces: list[str] = [first[marker_idx:]]
+        j = i + 1
+        # Keep consuming until we see a '>' in the accumulated tag text.
+        while j < len(token_strs) and ">" not in "".join(tag_pieces):
+            tag_pieces.append(token_strs[j])
+            j += 1
+
+        tag_text = "".join(tag_pieces)
+        gt = tag_text.find(">")
+        if gt == -1:
+            return None
+        tag_text = tag_text[: gt + 1]
+
+        # Normalize and determine open vs close.
+        normalized = tag_text.strip()
+        # Handle both `<...>` and `...>` variants.
+        if normalized.startswith("<"):
+            normalized = normalized[1:]
+        if normalized.endswith(">"):
+            normalized = normalized[:-1]
+        normalized = normalized.strip()
+
+        is_close = normalized.startswith("/") or "</" in tag_text
+
+        # Strip close marker variants like `/00:01.5`.
+        normalized = normalized.lstrip("/")
+        seconds = _parse_timestamp_seconds(normalized)
+        if seconds is None:
+            return None
+        return j, prefix_text, is_close, seconds
+
+    segments: list[tuple[float, float, str, list[int]]] = []
+    current_start: float | None = None
+    current_text_parts: list[str] = []
+    current_text_token_ids: list[int] = []
+
+    i = 0
+    while i < len(token_strs) and i < len(token_ids):
+        consumed = _consume_tag_at(i)
+        if consumed is None:
+            if current_start is not None:
+                current_text_parts.append(token_strs[i])
+                current_text_token_ids.append(token_ids[i])
+            i += 1
+            continue
+
+        next_i, prefix_text, is_close, ts_seconds = consumed
+
+        # If this tag-start token contains non-tag prefix text (e.g. `.</`),
+        # keep that prefix as segment text.
+        if prefix_text and current_start is not None:
+            current_text_parts.append(prefix_text)
+
+        if not is_close:
+            # Opening tag.
+            # If we were already in a segment, close it at this boundary.
+            if current_start is not None:
+                boundary = start_time + ts_seconds
+                segments.append(
+                    (
+                        current_start,
+                        boundary,
+                        "".join(current_text_parts),
+                        current_text_token_ids,
+                    )
+                )
+            current_start = start_time + ts_seconds
+            current_text_parts = []
+            current_text_token_ids = []
+        else:
+            # Closing tag.
+            if current_start is not None:
+                end_time = start_time + ts_seconds
+                segments.append(
+                    (
+                        current_start,
+                        end_time,
+                        "".join(current_text_parts),
+                        current_text_token_ids,
+                    )
+                )
+            current_start = None
+            current_text_parts = []
+            current_text_token_ids = []
+
+        i = max(i + 1, next_i)
+
+    return segments
+
 
 class OpenAISpeechToText(OpenAIServing):
     """Base class for speech-to-text operations like transcription and
     translation."""
+
+    def _append_initial_timestamp_token_ids_for_verbose_json(
+        self,
+        prompt_dict: dict,
+    ) -> None:
+        token_ids_obj = prompt_dict.get("prompt_token_ids")
+        if isinstance(token_ids_obj, tuple):
+            token_ids_list = list(token_ids_obj)
+        elif isinstance(token_ids_obj, list):
+            token_ids_list = token_ids_obj
+        else:
+            raise VLLMValidationError(
+                "speech_to_text verbose_json: prompt_token_ids is not list/tuple "
+                f"(type={type(token_ids_obj).__name__})",
+                value=type(token_ids_obj).__name__,
+            )
+
+        token_ids_list.extend(encode(self.tokenizer, VOXTRAL_TIMESTAMP))
+        prompt_dict["prompt_token_ids"] = token_ids_list
 
     def __init__(
         self,
@@ -301,14 +482,13 @@ class OpenAISpeechToText(OpenAIServing):
                 prompt_dict = cast(dict, prompt)
                 decoder_prompt = prompt.get("decoder_prompt")
                 if not isinstance(decoder_prompt, str):
-                    raise VLLMValidationError(
-                        "Expected decoder_prompt to be str",
-                        parameter="decoder_prompt",
-                        value=type(decoder_prompt).__name__,
+                    self._append_initial_timestamp_token_ids_for_verbose_json(
+                        prompt_dict
                     )
-                prompt_dict["decoder_prompt"] = decoder_prompt.replace(
-                    "<|notimestamps|>", "<|0.00|>"
-                )
+                else:
+                    prompt_dict["decoder_prompt"] = decoder_prompt.replace(
+                        "<|notimestamps|>", "<|0.00|>"
+                    )
             prompts.append(prompt)
         return prompts, duration
 
@@ -332,7 +512,84 @@ class OpenAISpeechToText(OpenAIServing):
         in this implementation and will be None. See docs for details.
         """
         BASE_OFFSET = 0.02
-        init_token = self.tokenizer.encode("<|0.00|>", add_special_tokens=False)[0]
+        if not tokens:
+            return []
+
+        token_ids_list = [int(t) for t in tokens if isinstance(t, (int, np.integer))]
+        token_strs: list[str] | None = None
+        token_strs_raw = self.tokenizer.convert_ids_to_tokens(token_ids_list)
+        if isinstance(token_strs_raw, str):
+            token_strs = [token_strs_raw]
+        elif isinstance(token_strs_raw, list):
+            token_strs = [str(t) for t in token_strs_raw]
+        else:
+            token_strs = [str(token_strs_raw)]
+
+        # Remove EOS if present.
+        if tokens[-1] == self.tokenizer.eos_token_id:
+            tokens = tokens[:-1]
+
+        init_token_ids = encode(self.tokenizer, VOXTRAL_TIMESTAMP)
+        if not init_token_ids:
+            logger.warning(
+                "verbose_json segment reconstruction: tokenizer cannot encode "
+                "<|0.00|>; returning empty segments (model=%s)",
+                request.model,
+            )
+            return []
+
+        # Some tokenizers (e.g. sentencepiece variants) treat timestamp markers
+        # as plain text and split them across multiple token IDs. In that case,
+        # parse timestamps from text tags like `<00:01.5>` and `</00:01.5>`.
+        if len(init_token_ids) != 1:
+            if token_strs is None:
+                convert_ids_to_tokens = getattr(
+                    self.tokenizer, "convert_ids_to_tokens", None
+                )
+                if not callable(convert_ids_to_tokens):
+                    logger.warning(
+                        "verbose_json segment reconstruction: tokenizer has no convert_ids_to_tokens; cannot parse timestamp tags (model=%s)",
+                        request.model,
+                    )
+                    return []
+
+                token_strs_raw = convert_ids_to_tokens(token_ids_list)
+                if isinstance(token_strs_raw, str):
+                    token_strs = [token_strs_raw]
+                elif isinstance(token_strs_raw, list):
+                    token_strs = [str(t) for t in token_strs_raw]
+                else:
+                    token_strs = [str(token_strs_raw)]
+
+                if len(token_strs) != len(token_ids_list):
+                    token_strs = [
+                        str(convert_ids_to_tokens(tid)) for tid in token_ids_list
+                    ]
+
+            spans = _parse_verbose_json_segments_from_timestamp_tags(
+                init_token_ids + token_ids_list,
+                token_strs,
+                start_time=start_time,
+            )
+
+            segments: list[SpeechToTextSegment] = []
+            for seg_start, seg_end, seg_text, seg_token_ids in spans:
+                segments.append(
+                    cast(
+                        SpeechToTextSegment,
+                        segment_class(
+                            id=len(segments),
+                            seek=int(start_time),
+                            start=seg_start,
+                            end=seg_end,
+                            temperature=request.temperature,
+                            text=seg_text,
+                            tokens=seg_token_ids,
+                        ),
+                    )
+                )
+            return segments
+
         if tokens[-1] == self.tokenizer.eos_token_id:
             tokens = tokens[:-1]
 
