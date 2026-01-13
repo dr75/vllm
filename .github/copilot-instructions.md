@@ -1,3 +1,5 @@
+<!-- markdownlint-disable -->
+
 # Copilot instructions (vLLM)
 
 ## Scope

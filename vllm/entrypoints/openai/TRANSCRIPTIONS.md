@@ -1,3 +1,4 @@
+<!-- markdownlint-disable -->
 # Transcriptions & translations (OpenAI-compatible)
 
 This document explains how vLLM implements the OpenAI-compatible audio endpoints:
