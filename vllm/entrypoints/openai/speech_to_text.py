@@ -9,6 +9,7 @@ from functools import cached_property
 from typing import Literal, TypeAlias, TypeVar, cast
 
 import numpy as np
+import regex as re
 from fastapi import Request
 from transformers import PreTrainedTokenizerBase
 
@@ -80,21 +81,25 @@ def _parse_verbose_json_mistral(
 ) -> list[tuple[float, float, str, list[int]]]:
     """Parse verbose_json segments from timestamp tags emitted as text.
 
-    Some models emit timestamps as text tags like `<00:01.5>` and closing tags
-    like `</00:01.5>` (or even variants that omit the leading `<`, e.g.
-    `00:01.5>` or `/00:01.5>`). This helper is a best-effort parser that tries
-    to reconstruct (start, end, text, token_ids) segments from the token stream.
+    Assumptions for this parser:
+    - Timestamp tags are always complete within a single token string (not split
+        across tokens).
+    - Tags look like `<00:01.5>` / `</00:01.5>` and may omit the leading `<`
+        (e.g. `00:01.5>` or `/00:01.5>`). Prefix text before the tag marker in
+        the same token (e.g. `.</00:01.5>`) is preserved as segment text.
 
-    Signature is intentionally minimal to allow unit testing without a tokenizer.
+    Returns (start, end, text, token_ids) segments.
     """
 
     def _parse_timestamp_seconds(ts_text: str) -> float | None:
+        """Parse timestamp string like '00:01.5' to seconds."""
         ts_text = ts_text.strip()
         if not ts_text:
             return None
-        parts = ts_text.split(":")
         try:
+            parts = ts_text.split(":")
             total = 0.0
+            # Allow H:MM:SS.s / MM:SS.s / SS.s
             for p in parts[:-1]:
                 total = total * 60.0 + float(int(p))
             total = total * 60.0 + float(parts[-1])
@@ -102,127 +107,77 @@ def _parse_verbose_json_mistral(
         except Exception:
             return None
 
-    def _consume_tag_at(i: int) -> tuple[int, str, bool, float] | None:
-        """If a timestamp tag starts at i, return (next_i, prefix_text, is_close, seconds)."""
-        if i >= len(token_strs):
+    # Matches: <00:01.5>   </00:01.5>   /00:01.5>   00:01.5>
+    # Preserves any prefix text before the tag marker.
+    tag_re = re.compile(r"^(?P<prefix>.*?)(?P<marker></|<|/)?(?P<ts>\d+(?::\d+)*\.\d+)>\s*$")
+
+    def _parse_tag(token_text: str) -> tuple[str, bool, float] | None:
+        """Parse a timestamp tag. Returns (prefix_text, is_close, seconds)."""
+        m = tag_re.match(token_text)
+        if m is None:
             return None
 
-        first = token_strs[i]
-        if not first:
-            return None
+        prefix_text = m.group("prefix") or ""
+        marker = m.group("marker") or ""
+        is_close = marker in ("</", "/")
 
-        # Heuristic: tags will end with `>` within a short window and contain
-        # both ':' and '.' to represent seconds.
-        lookahead = "".join(token_strs[i : min(len(token_strs), i + 24)])
-        if ">" not in lookahead or ":" not in lookahead or "." not in lookahead:
-            return None
-
-        # Tag start must be plausible: `<...`, `</...`, `/...`, or `00:...>`.
-        stripped = first.lstrip()
-        if not (
-            "<" in first
-            or stripped.startswith("/")
-            or stripped[:1].isdigit()
-            or first.endswith("/")
-        ):
-            return None
-
-        # Split any prefix text before a tag marker; e.g. token like `.</`.
-        marker_idx = -1
-        for ch in ("<", "/"):
-            idx = first.find(ch)
-            if idx != -1 and (marker_idx == -1 or idx < marker_idx):
-                marker_idx = idx
-        if marker_idx == -1:
-            marker_idx = 0
-
-        prefix_text = first[:marker_idx]
-        tag_pieces: list[str] = [first[marker_idx:]]
-        j = i + 1
-        # Keep consuming until we see a '>' in the accumulated tag text.
-        while j < len(token_strs) and ">" not in "".join(tag_pieces):
-            tag_pieces.append(token_strs[j])
-            j += 1
-
-        tag_text = "".join(tag_pieces)
-        gt = tag_text.find(">")
-        if gt == -1:
-            return None
-        tag_text = tag_text[: gt + 1]
-
-        # Normalize and determine open vs close.
-        normalized = tag_text.strip()
-        # Handle both `<...>` and `...>` variants.
-        if normalized.startswith("<"):
-            normalized = normalized[1:]
-        if normalized.endswith(">"):
-            normalized = normalized[:-1]
-        normalized = normalized.strip()
-
-        is_close = normalized.startswith("/") or "</" in tag_text
-
-        # Strip close marker variants like `/00:01.5`.
-        normalized = normalized.lstrip("/")
-        seconds = _parse_timestamp_seconds(normalized)
+        seconds = _parse_timestamp_seconds(m.group("ts"))
         if seconds is None:
             return None
-        return j, prefix_text, is_close, seconds
+        return prefix_text, is_close, seconds
+
+    # Align token_ids and token_strs (caller may prepend extra token_ids)
+    id_offset = max(0, len(token_ids) - len(token_strs))
 
     segments: list[tuple[float, float, str, list[int]]] = []
     current_start: float | None = None
     current_text_parts: list[str] = []
-    current_text_token_ids: list[int] = []
+    current_token_ids: list[int] = []
 
-    i = 0
-    while i < len(token_strs) and i < len(token_ids):
-        consumed = _consume_tag_at(i)
-        if consumed is None:
+    def _close_segment(end_seconds: float) -> None:
+        """Close and append the current segment."""
+        if current_start is not None:
+            segments.append(
+                (
+                    current_start,
+                    start_time + end_seconds,
+                    "".join(current_text_parts),
+                    current_token_ids,
+                )
+            )
+
+    for i, token_text in enumerate(token_strs):
+        if i + id_offset >= len(token_ids):
+            break
+
+        token_id = token_ids[i + id_offset]
+        tag = _parse_tag(token_text)
+
+        if tag is None:
+            # Regular text token
             if current_start is not None:
-                current_text_parts.append(token_strs[i])
-                current_text_token_ids.append(token_ids[i])
-            i += 1
+                current_text_parts.append(token_text)
+                current_token_ids.append(token_id)
             continue
 
-        next_i, prefix_text, is_close, ts_seconds = consumed
+        prefix_text, is_close, ts_seconds = tag
 
-        # If this tag-start token contains non-tag prefix text (e.g. `.</`),
-        # keep that prefix as segment text.
+        # Add prefix text to current segment (no token_id for prefix)
         if prefix_text and current_start is not None:
             current_text_parts.append(prefix_text)
 
-        if not is_close:
-            # Opening tag.
-            # If we were already in a segment, close it at this boundary.
-            if current_start is not None:
-                boundary = start_time + ts_seconds
-                segments.append(
-                    (
-                        current_start,
-                        boundary,
-                        "".join(current_text_parts),
-                        current_text_token_ids,
-                    )
-                )
-            current_start = start_time + ts_seconds
-            current_text_parts = []
-            current_text_token_ids = []
-        else:
-            # Closing tag.
-            if current_start is not None:
-                end_time = start_time + ts_seconds
-                segments.append(
-                    (
-                        current_start,
-                        end_time,
-                        "".join(current_text_parts),
-                        current_text_token_ids,
-                    )
-                )
+        if is_close:
+            # Close current segment
+            _close_segment(ts_seconds)
             current_start = None
-            current_text_parts = []
-            current_text_token_ids = []
+        else:
+            # Opening tag - close previous segment if any, then start new one
+            if current_start is not None:
+                _close_segment(ts_seconds)
 
-        i = max(i + 1, next_i)
+            current_start = start_time + ts_seconds
+        current_text_parts = []
+        current_token_ids = []
 
     return segments
 
