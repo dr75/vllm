@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from vllm.entrypoints.openai.speech_to_text import (
-    _parse_verbose_json_segments_from_timestamp_tags,
+    _parse_verbose_json_mistral,
 )
 
 
@@ -720,13 +720,13 @@ TEST_CASES = [
 
 
 @pytest.mark.parametrize("case", TEST_CASES, ids=[c["name"] for c in TEST_CASES])
-def test_parse_verbose_json_segments_from_timestamp_tags(case):
+def _parse_verbose_json_mistral(case):
     token_ids = case["token_ids"]
     id_to_tok = _load_voxtral_tokens_for_ids(token_ids)
     token_strs = [id_to_tok[i] for i in token_ids]
     start_time = float(case.get("start_time", 0.0))
 
-    spans = _parse_verbose_json_segments_from_timestamp_tags(
+    spans = _parse_verbose_json_mistral(
         token_ids,
         token_strs,
         start_time=start_time,

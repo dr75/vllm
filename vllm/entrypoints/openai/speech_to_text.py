@@ -72,7 +72,7 @@ def encode(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
     return [int(t) for t in token_ids]
 
 
-def _parse_verbose_json_segments_from_timestamp_tags(
+def _parse_verbose_json_mistral(
     token_ids: list[int],
     token_strs: list[str],
     *,
@@ -566,7 +566,7 @@ class OpenAISpeechToText(OpenAIServing):
                         str(convert_ids_to_tokens(tid)) for tid in token_ids_list
                     ]
 
-            spans = _parse_verbose_json_segments_from_timestamp_tags(
+            spans = _parse_verbose_json_mistral(
                 init_token_ids + token_ids_list,
                 token_strs,
                 start_time=start_time,
