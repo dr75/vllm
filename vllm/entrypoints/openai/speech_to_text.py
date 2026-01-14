@@ -65,6 +65,181 @@ ResponseType: TypeAlias = (
 logger = init_logger(__name__)
 
 
+def voxtralInitTokens(tokenizer: PreTrainedTokenizerBase) -> list[int]:
+    VOXTRAL_TIMESTAMP = "<00:00.0>"
+
+    token_ids = tokenizer.encode(VOXTRAL_TIMESTAMP, add_special_tokens=False)
+    res = [int(t) for t in token_ids]
+    if not res:
+        raise ValueError(
+            "Tokenizer failed to encode timestamp token "
+            f"'{VOXTRAL_TIMESTAMP}' into any token ids."
+        )
+    return res
+
+
+def _token_ids_to_token_strs(
+    tokenizer: PreTrainedTokenizerBase,
+    token_ids: list[int],
+) -> list[str]:
+    """Best-effort conversion from token ids to per-id token strings.
+
+    Some tokenizer implementations / type stubs can confuse static checkers or
+    return odd shapes for bulk conversion. This helper centralizes the runtime
+    behavior and keeps the rest of the code clean.
+
+    Raises an exception if the tokenizer doesn't expose a callable
+    `convert_ids_to_tokens`, or if conversion fails to align.
+    """
+
+    convert_attr = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if not callable(convert_attr):
+        raise ValueError(
+            "Tokenizer does not have a callable "
+            "`convert_ids_to_tokens` method for token id to string conversion."
+        )
+
+    # NOTE: Some versions of `transformers` ship type stubs that confuse
+    # static checkers into thinking `convert_ids_to_tokens` is not callable.
+    convert_ids_to_tokens_fn = cast(
+        Callable[[list[int]], str | list[str]],
+        convert_attr,
+    )
+
+    token_strs_raw = convert_ids_to_tokens_fn(token_ids)
+    token_strs: list[str] = []
+    if isinstance(token_strs_raw, list) and len(token_strs_raw) == len(token_ids):
+        token_strs = [str(t) for t in token_strs_raw]
+    else:
+        # Best-effort alignment: fall back to per-id conversion.
+        for tid in token_ids:
+            per_raw = convert_ids_to_tokens_fn([tid])
+            if isinstance(per_raw, list) and per_raw:
+                token_strs.append(str(per_raw[0]))
+            elif isinstance(per_raw, str):
+                token_strs.append(per_raw)
+            else:
+                token_strs.append(str(per_raw))
+
+    if len(token_strs) != len(token_ids):
+        raise ValueError(
+            "Tokenizer `convert_ids_to_tokens` returned unexpected number of tokens."
+        )
+    return token_strs
+
+
+def _parse_verbose_json_voxtral(
+    token_ids: list[int],
+    token_strs: list[str],
+    *,
+    start_time: float,
+) -> list[tuple[float, float, str, list[int]]]:
+    """Parse verbose_json segments from timestamp tags emitted as text.
+
+    Voxtral tokenizers may split timestamp tags across multiple tokens, e.g.
+    `<00:01.5>` becomes `'<', '0', '0', ':', '0', '1', '.', '5', '>'`.
+    This helper is a best-effort parser that can consume tags spanning multiple
+    tokens, and reconstruct (start, end, text, token_ids) segments.
+
+    Returns (start, end, text, token_ids) segments.
+    """
+
+    n = min(len(token_strs), len(token_ids))
+
+    def _parse_timestamp_seconds(ts_text: str) -> float | None:
+        """Parse timestamp string like '00:01.5' to total seconds."""
+        try:
+            parts = ts_text.strip().split(":")
+            if len(parts) != 2:
+                return None
+
+            return float(parts[0]) * 60 + float(parts[1])
+        except Exception:
+            return None
+
+    def _consume_tag_at(i: int) -> tuple[int, str, bool, float] | None:
+        """If a timestamp tag starts at i, return seconds."""
+        if i >= len(token_strs) or "<" not in token_strs[i]:
+            return None
+
+        lookahead = "".join(token_strs[i : i + 10])
+        end_idx = lookahead.find(">")
+        if end_idx == -1:
+            return None
+
+        next_i = len(token_strs)
+        for idx in range(i + 1, len(token_strs)):
+            if ">" in token_strs[idx]:
+                next_i = idx + 1
+                break
+
+        start_idx = lookahead.find("<")
+        prefix_text = lookahead[:start_idx]
+        tag_text = lookahead[start_idx + 1 : end_idx]
+        is_close = tag_text.startswith("/")
+        tag_text = tag_text.lstrip("/")
+
+        seconds = _parse_timestamp_seconds(tag_text)
+        if seconds is None:
+            return None
+
+        return next_i, prefix_text, is_close, seconds
+
+    segments: list[tuple[float, float, str, list[int]]] = []
+    current_start: float | None = None
+    current_text_parts: list[str] = []
+    current_token_ids: list[int] = []
+
+    def _append_segment(end_seconds: float) -> None:
+        """Close and append the current segment."""
+        if current_start is not None:
+            segments.append(
+                (
+                    current_start,
+                    start_time + end_seconds,
+                    "".join(current_text_parts),
+                    current_token_ids,
+                )
+            )
+
+    i = 0
+    while i < n:
+        token_text = token_strs[i]
+        token_id = token_ids[i]
+
+        consumed = _consume_tag_at(i)
+        if consumed is None:
+            if current_start is not None:
+                current_text_parts.append(token_text)
+                current_token_ids.append(token_id)
+            i += 1
+            continue
+
+        next_i, prefix_text, is_close, ts_seconds = consumed
+
+        # Add prefix text to current segment (no token_id for prefix)
+        if prefix_text and current_start is not None:
+            current_text_parts.append(prefix_text)
+
+        if is_close:
+            # Close current segment
+            _append_segment(ts_seconds)
+            current_start = None
+        else:
+            # Opening tag - close previous segment if any, then start new one
+            if current_start is not None:
+                _append_segment(ts_seconds)
+            current_start = start_time + ts_seconds
+
+        current_text_parts = []
+        current_token_ids = []
+
+        # Jump past the consumed tag tokens.
+        i = min(max(i + 1, next_i), n)
+
+    return segments
+
+
 class OpenAISpeechToText(OpenAIServing):
     """Base class for speech-to-text operations like transcription and
     translation."""
@@ -301,14 +476,23 @@ class OpenAISpeechToText(OpenAIServing):
                 prompt_dict = cast(dict, prompt)
                 decoder_prompt = prompt.get("decoder_prompt")
                 if not isinstance(decoder_prompt, str):
-                    raise VLLMValidationError(
-                        "Expected decoder_prompt to be str",
-                        parameter="decoder_prompt",
-                        value=type(decoder_prompt).__name__,
+                    # if the model is VoxtralForConditionalGeneration,
+                    # append voxtral initial timestamp token ids
+                    if "voxtral" in self.model_cls.__name__.lower():
+                        prompt_dict["prompt_token_ids"].extend(
+                            voxtralInitTokens(self.tokenizer)
+                        )
+                    else:
+                        raise VLLMValidationError(
+                            "Expected decoder_prompt to be str",
+                            parameter="decoder_prompt",
+                            value=type(decoder_prompt).__name__,
+                        )
+                else:
+                    # Whisper
+                    prompt_dict["decoder_prompt"] = decoder_prompt.replace(
+                        "<|notimestamps|>", "<|0.00|>"
                     )
-                prompt_dict["decoder_prompt"] = decoder_prompt.replace(
-                    "<|notimestamps|>", "<|0.00|>"
-                )
             prompts.append(prompt)
         return prompts, duration
 
@@ -332,6 +516,41 @@ class OpenAISpeechToText(OpenAIServing):
         in this implementation and will be None. See docs for details.
         """
         BASE_OFFSET = 0.02
+        if not tokens:
+            return []
+
+        if "voxtral" in self.model_cls.__name__.lower():
+            token_ids = [int(t) for t in tokens if isinstance(t, (int, np.integer))]
+
+            # Remove EOS if present.
+            if token_ids and token_ids[-1] == self.tokenizer.eos_token_id:
+                token_ids = token_ids[:-1]
+
+            token_ids_list = voxtralInitTokens(self.tokenizer) + token_ids
+            spans = _parse_verbose_json_voxtral(
+                token_ids_list,
+                _token_ids_to_token_strs(self.tokenizer, token_ids_list),
+                start_time=start_time,
+            )
+
+            voxtral_segments: list[SpeechToTextSegment] = []
+            for seg_start, seg_end, seg_text, seg_token_ids in spans:
+                voxtral_segments.append(
+                    cast(
+                        SpeechToTextSegment,
+                        segment_class(
+                            id=len(voxtral_segments),
+                            seek=int(start_time),
+                            start=seg_start,
+                            end=seg_end,
+                            temperature=request.temperature,
+                            text=seg_text,
+                            tokens=seg_token_ids,
+                        ),
+                    )
+                )
+            return voxtral_segments
+
         init_token = self.tokenizer.encode("<|0.00|>", add_special_tokens=False)[0]
         if tokens[-1] == self.tokenizer.eos_token_id:
             tokens = tokens[:-1]
