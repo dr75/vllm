@@ -254,7 +254,7 @@ class OpenAISpeechToText(OpenAIServing):
         self,
         request: SpeechToTextRequest,
         audio_data: bytes,
-    ) -> tuple[list[PromptType], float]:
+    ) -> tuple[list[PromptType], list[float], float]:
         # Validate request
         language = self.model_cls.validate_language(request.language)
         # Skip to_language validation to avoid extra logging for Whisper.
@@ -283,6 +283,8 @@ class OpenAISpeechToText(OpenAIServing):
         )
         chunks = [y] if not do_split_audio else self._split_audio(y, int(sr))
         prompts = []
+        start_times = []
+        chunk_offset = 0
         for chunk in chunks:
             # The model has control over the construction, as long as it
             # returns a valid PromptType.
@@ -314,7 +316,9 @@ class OpenAISpeechToText(OpenAIServing):
                     "<|notimestamps|>", "<|0.00|>"
                 )
             prompts.append(prompt)
-        return prompts, duration
+            start_times.append(chunk_offset / sr)
+            chunk_offset += len(chunk)
+        return prompts, start_times, duration
 
     def _get_verbose_segments(
         self,
@@ -362,7 +366,7 @@ class OpenAISpeechToText(OpenAIServing):
                     SpeechToTextSegment,
                     segment_class(
                         id=len(segments),
-                        seek=start_time,
+                        seek=int(start_time),
                         start=start_time + BASE_OFFSET * start_timestamp,
                         end=start_time + BASE_OFFSET * end_timestamp,
                         temperature=request.temperature,
@@ -431,7 +435,7 @@ class OpenAISpeechToText(OpenAIServing):
         try:
             lora_request = self._maybe_get_adapters(request)
 
-            prompts, duration_s = await self._preprocess_speech_to_text(
+            prompts, start_times, duration_s = await self._preprocess_speech_to_text(
                 request=request,
                 audio_data=audio_data,
             )
@@ -510,7 +514,7 @@ class OpenAISpeechToText(OpenAIServing):
                                 tokens=tuple(op.outputs[0].token_ids),
                                 segment_class=segment_class,
                                 request=request,
-                                start_time=start_time,
+                                start_time=start_times[idx],
                                 log_probs=op.outputs[0].logprobs,
                             )
                         )
