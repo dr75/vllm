@@ -9,9 +9,10 @@ from collections.abc import AsyncGenerator, Callable
 from functools import cached_property
 from typing import Final, Literal, TypeAlias, TypeVar, cast
 
+import av
 import numpy as np
+from av.container import InputContainer
 from fastapi import Request
-from soundfile import LibsndfileError
 from transformers import PreTrainedTokenizerBase
 
 import vllm.envs as envs
@@ -58,14 +59,6 @@ try:
 except ImportError:
     librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
-# Public libsndfile error codes exposed via `soundfile.LibsndfileError.code`, soundfile
-# being librosa's main backend. Used to validate if an audio loading error is due to a
-# server error vs a client error (invalid audio file).
-# 1 = unrecognised format      (file is not a supported audio container)
-# 3 = malformed file           (corrupt or structurally invalid audio)
-# 4 = unsupported encoding     (codec not supported by this libsndfile build)
-_BAD_SF_CODES = {1, 3, 4}
-
 SpeechToTextResponse: TypeAlias = TranscriptionResponse | TranslationResponse
 SpeechToTextResponseVerbose: TypeAlias = (
     TranscriptionResponseVerbose | TranslationResponseVerbose
@@ -83,6 +76,51 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+
+def decode_audio(audio_data: bytes, sample_rate: int) -> tuple[np.ndarray, int]:
+    try:
+        with io.BytesIO(audio_data) as bytes_:
+            container = cast(InputContainer, av.open(bytes_))
+            stream = container.streams.audio[0]
+            sr_native = stream.rate
+            samples = []
+            for frame in container.decode(stream):
+                frame_array = frame.to_ndarray()
+
+                if np.issubdtype(frame_array.dtype, np.signedinteger):
+                    dtype_info = np.iinfo(frame_array.dtype)
+                    max_val = max(abs(dtype_info.min), dtype_info.max)
+                    frame_array = frame_array.astype(np.float32) / float(max_val)
+                elif np.issubdtype(frame_array.dtype, np.unsignedinteger):
+                    dtype_info = np.iinfo(frame_array.dtype)
+                    mid = (dtype_info.max + 1.0) / 2.0
+                    frame_array = (frame_array.astype(np.float32) - mid) / mid
+                elif np.issubdtype(frame_array.dtype, np.floating):
+                    frame_array = frame_array.astype(np.float32)
+                else:
+                    raise ValueError(f"Unsupported audio dtype: {frame_array.dtype}")
+
+                if frame_array.ndim > 1:
+                    frame_array = np.mean(frame_array, axis=0)
+                samples.append(frame_array)
+            if not samples:
+                raise ValueError("Failed to decode audio.")
+            audio = np.concatenate(samples).astype(np.float32)
+            if sr_native != sample_rate:
+                audio = librosa.resample(
+                    audio,
+                    orig_sr=sr_native,
+                    target_sr=sample_rate,
+                )
+            return audio, sample_rate
+    except (
+        av.error.DecoderNotFoundError,
+        av.error.DemuxerNotFoundError,
+        av.error.InvalidDataError,
+        IndexError,
+    ) as exc:
+        raise ValueError("Invalid or unsupported audio file.") from exc
 
 
 class OpenAISpeechToText(OpenAIServing):
@@ -323,16 +361,9 @@ class OpenAISpeechToText(OpenAIServing):
                 value=len(audio_data) / 1024**2,
             )
 
-        with io.BytesIO(audio_data) as bytes_:
-            try:
-                # NOTE resample to model SR here for efficiency. This is also a
-                # pre-requisite for chunking, as it assumes Whisper SR.
-                y, sr = librosa.load(bytes_, sr=self.asr_config.sample_rate)
-            except LibsndfileError as exc:
-                # Distinguish client errors (invalid audio) from server errors
-                if exc.code in _BAD_SF_CODES:
-                    raise ValueError("Invalid or unsupported audio file.") from exc
-                raise
+        # NOTE resample to model SR here for efficiency. This is also a
+        # pre-requisite for chunking, as it assumes Whisper SR.
+        y, sr = decode_audio(audio_data, int(self.asr_config.sample_rate))
 
         duration = librosa.get_duration(y=y, sr=sr)
         do_split_audio = (
