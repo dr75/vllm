@@ -9,7 +9,9 @@ from collections.abc import AsyncGenerator, Callable, Set
 from functools import cached_property
 from typing import Final, Literal, TypeAlias, TypeVar, cast
 
+import av
 import numpy as np
+from av.container import InputContainer
 from fastapi import Request
 from transformers import PreTrainedTokenizerBase
 
@@ -43,12 +45,17 @@ from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.model_executor.models import SupportsTranscription
 from vllm.multimodal.audio import get_audio_duration, split_audio
-from vllm.multimodal.media.audio import load_audio
 from vllm.outputs import RequestOutput
 from vllm.renderers.inputs import DictPrompt, EncoderDecoderDictPrompt
 from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_prompt
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
+from vllm.utils.import_utils import PlaceholderModule
+
+try:
+    import librosa
+except ImportError:
+    librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
 SpeechToTextResponse: TypeAlias = TranscriptionResponse | TranslationResponse
 SpeechToTextResponseVerbose: TypeAlias = (
@@ -78,6 +85,51 @@ def asr_inter_chunk_separator(
     separator; others use a single ASCII space.
     """
     return "" if language and language.lower() in no_space_languages else " "
+
+
+def decode_audio(audio_data: bytes, sample_rate: int) -> tuple[np.ndarray, int]:
+    try:
+        with io.BytesIO(audio_data) as bytes_:
+            container = cast(InputContainer, av.open(bytes_))
+            stream = container.streams.audio[0]
+            sr_native = stream.rate
+            samples = []
+            for frame in container.decode(stream):
+                frame_array = frame.to_ndarray()
+
+                if np.issubdtype(frame_array.dtype, np.signedinteger):
+                    dtype_info = np.iinfo(frame_array.dtype)
+                    max_val = max(abs(dtype_info.min), dtype_info.max)
+                    frame_array = frame_array.astype(np.float32) / float(max_val)
+                elif np.issubdtype(frame_array.dtype, np.unsignedinteger):
+                    dtype_info = np.iinfo(frame_array.dtype)
+                    mid = (dtype_info.max + 1.0) / 2.0
+                    frame_array = (frame_array.astype(np.float32) - mid) / mid
+                elif np.issubdtype(frame_array.dtype, np.floating):
+                    frame_array = frame_array.astype(np.float32)
+                else:
+                    raise ValueError(f"Unsupported audio dtype: {frame_array.dtype}")
+
+                if frame_array.ndim > 1:
+                    frame_array = np.mean(frame_array, axis=0)
+                samples.append(frame_array)
+            if not samples:
+                raise ValueError("Failed to decode audio.")
+            audio = np.concatenate(samples).astype(np.float32)
+            if sr_native != sample_rate:
+                audio = librosa.resample(
+                    audio,
+                    orig_sr=sr_native,
+                    target_sr=sample_rate,
+                )
+            return audio, sample_rate
+    except (
+        av.error.DecoderNotFoundError,
+        av.error.DemuxerNotFoundError,
+        av.error.InvalidDataError,
+        IndexError,
+    ) as exc:
+        raise ValueError("Invalid or unsupported audio file.") from exc
 
 
 class OpenAISpeechToText(OpenAIServing):
@@ -198,16 +250,9 @@ class OpenAISpeechToText(OpenAIServing):
                 value=len(audio_data) / 1024**2,
             )
 
-        # Decode audio bytes.  For container formats (MP4, M4A, WebM) that
-        # soundfile cannot detect from a BytesIO stream, _load_audio_bytes
-        # transparently falls back to ffmpeg via an in-memory fd.
         # NOTE resample to model SR here for efficiency. This is also a
         # pre-requisite for chunking, as it assumes Whisper SR.
-        try:
-            with io.BytesIO(audio_data) as buf:
-                y, sr = load_audio(buf, sr=self.asr_config.sample_rate)
-        except Exception as exc:
-            raise ValueError("Invalid or unsupported audio file.") from exc
+        y, sr = decode_audio(audio_data, int(self.asr_config.sample_rate))
 
         duration = get_audio_duration(y=y, sr=sr)
         do_split_audio = self.asr_config.allow_audio_chunking and (
@@ -527,9 +572,6 @@ class OpenAISpeechToText(OpenAIServing):
                     "`max_audio_clip_s` is set to None, audio cannot be chunked"
                 )
             for idx, result_generator in enumerate(list_result_generator):
-                start_time = (
-                    float(idx * chunk_size_in_s) if chunk_size_in_s is not None else 0.0
-                )
                 async for op in result_generator:
                     if request.response_format == "verbose_json":
                         assert op.outputs[0].logprobs
