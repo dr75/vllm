@@ -345,6 +345,7 @@ class VoxtralForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsTranscription
 ):
     supported_languages = ISO639_1_SUPPORTED_LANGS
+    supports_segment_timestamp = True
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -468,13 +469,18 @@ class VoxtralForConditionalGeneration(
     ) -> SpeechToTextConfig:
         tokenizer = cached_tokenizer_from_config(model_config)
         audio_config = tokenizer.instruct.audio_encoder.audio_config
-        max_audio_clip_s = audio_config.chunk_length_s
+
+        # Up to 39min work, but depending on text length potentially less so
+        # keep it safe at 30min.
+        # Adding 1s to keep the chunk size around 30min when applying a split
+        # window of 2s.
+        max_audio_clip_s = 30 * 60 + 1
         sample_rate = audio_config.sampling_rate
         return SpeechToTextConfig(
             max_audio_clip_s=max_audio_clip_s,
+            overlap_chunk_second=2,
             sample_rate=sample_rate,
-            # mistral_common and whisper encoder take care of chunking
-            min_energy_split_window_size=None,
+            min_energy_split_window_size=1600,
         )
 
     @classmethod
