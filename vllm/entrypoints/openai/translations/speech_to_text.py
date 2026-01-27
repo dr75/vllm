@@ -9,7 +9,9 @@ from collections.abc import AsyncGenerator, Callable
 from functools import cached_property
 from typing import Literal, TypeAlias, TypeVar, cast
 
+import av
 import numpy as np
+from av.container import InputContainer
 from fastapi import Request
 from transformers import PreTrainedTokenizerBase
 
@@ -67,6 +69,33 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+def decode_audio(audio_data: bytes, sample_rate: int) -> tuple[np.ndarray, int]:
+    with io.BytesIO(audio_data) as bytes_:
+        container = cast(InputContainer, av.open(bytes_))
+        stream = container.streams.audio[0]
+        sr_native = stream.rate
+        samples = []
+        for frame in container.decode(stream):
+            frame_array = frame.to_ndarray()
+
+            dtype_info = np.iinfo(frame_array.dtype)
+            if np.issubdtype(frame_array.dtype, np.signedinteger):
+                max_val = max(abs(dtype_info.min), dtype_info.max)
+                frame_array = frame_array.astype(np.float32) / float(max_val)
+            elif np.issubdtype(frame_array.dtype, np.unsignedinteger):
+                mid = (dtype_info.max + 1.0) / 2.0
+                frame_array = (frame_array.astype(np.float32) - mid) / mid
+
+            if frame_array.ndim > 1:
+                frame_array = np.mean(frame_array, axis=0)
+            samples.append(frame_array)
+        if not samples:
+            raise ValueError("Failed to decode audio.")
+        audio = np.concatenate(samples).astype(np.float32)
+        if sr_native != sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr_native, target_sr=sample_rate)
+        return audio, sample_rate
 
 
 class OpenAISpeechToText(OpenAIServing):
@@ -271,10 +300,9 @@ class OpenAISpeechToText(OpenAIServing):
                 value=len(audio_data) / 1024**2,
             )
 
-        with io.BytesIO(audio_data) as bytes_:
-            # NOTE resample to model SR here for efficiency. This is also a
-            # pre-requisite for chunking, as it assumes Whisper SR.
-            y, sr = librosa.load(bytes_, sr=self.asr_config.sample_rate)
+        # NOTE resample to model SR here for efficiency. This is also a
+        # pre-requisite for chunking, as it assumes Whisper SR.
+        y, sr = decode_audio(audio_data, int(self.asr_config.sample_rate))
 
         duration = librosa.get_duration(y=y, sr=sr)
         do_split_audio = (
