@@ -1,0 +1,9 @@
+Given the commits below (defined via their commit message), get the commit id on the current branch and create the respective patch file.
+
+Note that multiple commits may go into one patch. Those commits are separated by "+".
+
+fix chunking + audio decode -> transcriptions.patch
+voxtral -> voxtral.patch
+
+The patches must be stored in the root.
+Then copied to ../continuum/charts/continuum-application/conf/
