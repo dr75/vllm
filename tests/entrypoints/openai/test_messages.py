@@ -246,3 +246,69 @@ async def test_anthropic_usage_cache_streaming(client: anthropic.AsyncAnthropic)
     assert total_delta == total_prompt_tokens, (
         f"message_delta sum mismatch: {total_delta} != {total_prompt_tokens}"
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_cache_salt(client: anthropic.AsyncAnthropic):
+    """Test that cache_salt is forwarded and isolates prefix caches.
+
+    Two requests with the same prompt but different cache_salt values should
+    NOT share their prefix cache."""
+    _LONG_PROMPT = " ".join(["Explain streaming caches."] * 5)
+    messages = [{"role": "user", "content": _LONG_PROMPT}]
+    create_kwargs = dict(
+        model="claude-3-7-sonnet-latest",
+        max_tokens=10,
+        messages=messages,
+    )
+
+    # Request 1 with salt "alpha" — populates cache
+    await client.messages.create(**create_kwargs, extra_body={"cache_salt": "alpha"})
+
+    # Request 2 with same salt "alpha" — should hit cache
+    resp2 = await client.messages.create(
+        **create_kwargs, extra_body={"cache_salt": "alpha"}
+    )
+    cached_same = resp2.usage.cache_read_input_tokens or 0
+    assert cached_same > 0, "Expected cache hit with same cache_salt"
+
+    # Request 3 with different salt "beta" — should NOT hit cache
+    resp3 = await client.messages.create(
+        **create_kwargs, extra_body={"cache_salt": "beta"}
+    )
+    cached_diff = resp3.usage.cache_read_input_tokens or 0
+    assert cached_diff == 0, (
+        f"Expected no cache hit with different cache_salt, "
+        f"got cache_read_input_tokens={cached_diff}"
+    )
+
+    # Request 4 with invalid empty salt — should fail validation
+    with pytest.raises(anthropic.BadRequestError, match="cache_salt"):
+        await client.messages.create(**create_kwargs, extra_body={"cache_salt": ""})
+
+    # Request 5 — streaming with salt "alpha", should hit existing cache
+    stream1 = await client.messages.create(
+        **create_kwargs, stream=True, extra_body={"cache_salt": "alpha"}
+    )
+    message_delta_usage = None
+    async for event in stream1:
+        if event.type == "message_delta":
+            message_delta_usage = getattr(event, "usage", None)
+    assert message_delta_usage is not None
+    cached_stream = message_delta_usage.cache_read_input_tokens or 0
+    assert cached_stream > 0, "Expected cache hit with same cache_salt (streaming)"
+
+    # Request 6 — streaming with different salt "gamma", should NOT hit cache
+    stream2 = await client.messages.create(
+        **create_kwargs, stream=True, extra_body={"cache_salt": "gamma"}
+    )
+    message_delta_usage = None
+    async for event in stream2:
+        if event.type == "message_delta":
+            message_delta_usage = getattr(event, "usage", None)
+    assert message_delta_usage is not None
+    cached_stream_diff = message_delta_usage.cache_read_input_tokens or 0
+    assert cached_stream_diff == 0, (
+        f"Expected no cache hit with different cache_salt (streaming), "
+        f"got cache_read_input_tokens={cached_stream_diff}"
+    )
