@@ -111,6 +111,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+    cache_salt: str | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
     kv_transfer_params: dict[str, Any] | None = Field(
@@ -131,6 +132,15 @@ class AnthropicMessagesRequest(BaseModel):
         if v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_cache_salt_support(cls, data):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        return ChatCompletionRequest.check_cache_salt_support(data)
 
 
 class AnthropicDelta(BaseModel):
