@@ -361,6 +361,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
             kv_transfer_params=anthropic_request.kv_transfer_params,
+            cache_salt=anthropic_request.cache_salt,
         )
 
     @classmethod
