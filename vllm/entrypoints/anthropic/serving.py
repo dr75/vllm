@@ -208,6 +208,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             temperature=anthropic_request.temperature,
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
+            cache_salt=anthropic_request.cache_salt,
         )
 
         if anthropic_request.stream:

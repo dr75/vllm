@@ -5,7 +5,7 @@
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class AnthropicError(BaseModel):
@@ -92,6 +92,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+    cache_salt: str | None = None
 
     @field_validator("model")
     @classmethod
@@ -106,6 +107,15 @@ class AnthropicMessagesRequest(BaseModel):
         if v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_cache_salt_support(cls, data):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        return ChatCompletionRequest.check_cache_salt_support(data)
 
 
 class AnthropicDelta(BaseModel):
