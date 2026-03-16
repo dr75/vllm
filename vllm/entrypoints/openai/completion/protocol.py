@@ -46,7 +46,7 @@ class CompletionRequest(OpenAIBaseModel):
     model: str | None = None
     prompt: list[int] | list[list[int]] | str | list[str] | None = None
     echo: bool | None = False
-    frequency_penalty: float | None = 0.0
+    frequency_penalty: float | None = None
     logit_bias: dict[str, float] | None = None
     logprobs: int | None = None
     max_tokens: int | None = 16
@@ -190,6 +190,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     # Default sampling parameters for completion requests
     _DEFAULT_SAMPLING_PARAMS: dict = {
+        "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_p": 1.0,
@@ -228,6 +229,11 @@ class CompletionRequest(OpenAIBaseModel):
             default_sampling_params = {}
 
         # Default parameters
+        if (frequency_penalty := self.frequency_penalty) is None:
+            frequency_penalty = default_sampling_params.get(
+                "frequency_penalty",
+                self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"],
+            )
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get(
                 "repetition_penalty",
@@ -295,7 +301,7 @@ class CompletionRequest(OpenAIBaseModel):
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
             top_p=top_p,
