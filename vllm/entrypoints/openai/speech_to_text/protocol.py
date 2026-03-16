@@ -174,7 +174,7 @@ class TranscriptionRequest(OpenAIBaseModel):
     seed: int | None = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
     """The seed to use for sampling."""
 
-    frequency_penalty: float | None = 0.0
+    frequency_penalty: float | None = None
     """The frequency penalty to use for sampling."""
 
     repetition_penalty: float | None = None
@@ -189,6 +189,7 @@ class TranscriptionRequest(OpenAIBaseModel):
 
     # Default sampling parameters for transcription requests.
     _DEFAULT_SAMPLING_PARAMS: dict = {
+        "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_p": 1.0,
@@ -263,6 +264,11 @@ class TranscriptionRequest(OpenAIBaseModel):
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
 
+        if (frequency_penalty := self.frequency_penalty) is None:
+            frequency_penalty = default_sampling_params.get(
+                "frequency_penalty",
+                self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"],
+            )
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get(
                 "repetition_penalty",
@@ -276,7 +282,7 @@ class TranscriptionRequest(OpenAIBaseModel):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
-            frequency_penalty=self.frequency_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             presence_penalty=self.presence_penalty,
             output_kind=RequestOutputKind.DELTA
